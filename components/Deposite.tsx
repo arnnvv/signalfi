@@ -1,193 +1,254 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ethers } from "ethers";
 import { toast } from "sonner";
-import SettlementContractABI from "@/abi/SettlementContract.json";
 import { useWallet } from "./WalletProvider";
-
-const SETTLEMENT_CONTRACT_ADDRESS =
-  "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9";
-const USDC_CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-const USDC_DECIMALS = 6;
-
-const ERC20_ABI = [
-  "function approve(address spender, uint256 amount) external returns (bool)",
-  "function allowance(address owner, address spender) external view returns (uint256)",
-  "function balanceOf(address account) external view returns (uint256)",
-  "function decimals() external view returns (uint8)",
-  "function symbol() external view returns (string)",
-  "function name() external view returns (string)",
-];
+import {
+  CONTRACTS,
+  ERC20_ABI,
+  SETTLEMENT_ABI,
+  USDC_DECIMALS,
+} from "@/lib/config";
 
 export function Deposit() {
-  const { signer, address } = useWallet();
+  const { signer, address, isCorrectNetwork } = useWallet();
   const [amount, setAmount] = useState("");
+  const [balance, setBalance] = useState("0");
+  const [allowance, setAllowance] = useState("0");
+  const [depositBalance, setDepositBalance] = useState("0");
+  const [isApproving, setIsApproving] = useState(false);
+  const [isDepositing, setIsDepositing] = useState(false);
 
-  const handleDeposit = async () => {
-    if (!signer || !address) {
-      toast.error("Please connect your wallet first.");
-      return;
-    }
-    const depositAmount = parseFloat(amount);
-    if (!depositAmount || depositAmount <= 0) {
-      toast.error("Please enter a valid amount.");
-      return;
-    }
-
-    const toastId = toast.loading("Preparing USDC deposit...");
+  const loadBalances = async (retryCount = 0) => {
+    if (!signer || !address) return;
 
     try {
       const usdcContract = new ethers.Contract(
-        USDC_CONTRACT_ADDRESS,
+        CONTRACTS.USDC,
         ERC20_ABI,
         signer,
       );
       const settlementContract = new ethers.Contract(
-        SETTLEMENT_CONTRACT_ADDRESS,
-        SettlementContractABI.abi,
+        CONTRACTS.SETTLEMENT,
+        SETTLEMENT_ABI,
         signer,
       );
 
-      const amountInSmallestUnit = ethers.parseUnits(amount, USDC_DECIMALS);
+      const bal = await usdcContract.balanceOf(address);
+      setBalance(ethers.formatUnits(bal, USDC_DECIMALS));
 
-      toast.info("Checking USDC balance...", { id: toastId });
-      try {
-        const balance = await usdcContract.balanceOf(address);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const allow = await usdcContract.allowance(address, CONTRACTS.SETTLEMENT);
+      setAllowance(ethers.formatUnits(allow, USDC_DECIMALS));
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const depBal = await settlementContract.getDeposit(address);
+      setDepositBalance(ethers.formatUnits(depBal, USDC_DECIMALS));
+    } catch (err: any) {
+      console.error("Error loading balances:", err);
+
+      if (err.message?.includes("circuit breaker") && retryCount < 2) {
         console.log(
-          "USDC Balance:",
-          ethers.formatUnits(balance, USDC_DECIMALS),
+          `Circuit breaker detected, retrying in 2 seconds... (attempt ${retryCount + 1})`,
         );
-
-        if (balance < amountInSmallestUnit) {
-          toast.error("Insufficient USDC balance", {
-            id: toastId,
-            description: `You only have ${ethers.formatUnits(balance, USDC_DECIMALS)} USDC`,
-          });
-          return;
-        }
-      } catch (balanceError) {
-        console.error("Error checking balance:", balanceError);
-        toast.error("Failed to check USDC balance", {
-          id: toastId,
-          description: "Make sure the USDC contract address is correct",
-        });
-        return;
+        toast.info("MetaMask rate limit detected. Retrying...");
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        return loadBalances(retryCount + 1);
       }
 
-      toast.info("Checking USDC allowance...", { id: toastId });
-      let currentAllowance;
-      try {
-        currentAllowance = await usdcContract.allowance(
-          address,
-          SETTLEMENT_CONTRACT_ADDRESS,
-        );
-        console.log(
-          "Current Allowance:",
-          ethers.formatUnits(currentAllowance, USDC_DECIMALS),
-        );
-      } catch (allowanceError) {
-        console.error("Error checking allowance:", allowanceError);
-        toast.error("Failed to check allowance", {
-          id: toastId,
-          description: "The USDC contract may not be deployed correctly",
-        });
-        return;
-      }
-
-      if (currentAllowance < amountInSmallestUnit) {
-        toast.info("Please approve USDC spending in your wallet.", {
-          id: toastId,
-        });
-        try {
-          const approveTx = await usdcContract.approve(
-            SETTLEMENT_CONTRACT_ADDRESS,
-            amountInSmallestUnit,
-          );
-          console.log("Approve TX:", approveTx.hash);
-
-          toast.loading("Waiting for approval confirmation...", {
-            id: toastId,
-          });
-          const approveReceipt = await approveTx.wait();
-          console.log("Approve Receipt:", approveReceipt);
-
-          toast.success("Approval successful! Now confirming deposit...", {
-            id: toastId,
-          });
-        } catch (approveError) {
-          console.error("Approval failed:", approveError);
-          throw approveError;
-        }
-      } else {
-        console.log("Sufficient allowance already exists");
-      }
-
-      toast.loading("Sending deposit transaction...", { id: toastId });
-      try {
-        const depositTx =
-          await settlementContract.deposit(amountInSmallestUnit);
-        console.log("Deposit TX:", depositTx.hash);
-
-        toast.loading("Waiting for deposit confirmation...", { id: toastId });
-        const depositReceipt = await depositTx.wait();
-        console.log("Deposit Receipt:", depositReceipt);
-
-        toast.success("Deposit Successful!", {
-          id: toastId,
-          description: `Successfully deposited ${amount} USDC.`,
-        });
-        setAmount("");
-      } catch (depositError) {
-        console.error("Deposit transaction failed:", depositError);
-        throw depositError;
-      }
-    } catch (err: unknown) {
-      console.error("Deposit failed:", err);
-      let errorMessage = "An unknown error occurred";
-
-      if (typeof err === "object" && err !== null) {
-        const e = err as { code?: string; reason?: string; message?: string };
-
-        if (e.code === "ACTION_REJECTED") {
-          errorMessage = "User rejected the transaction";
-        } else if (e.reason) {
-          errorMessage = e.reason;
-        } else if (e.message) {
-          errorMessage = e.message;
-        }
-      } else if (typeof err === "string") {
-        errorMessage = err;
-      }
-
-      toast.error("Deposit Failed", {
-        id: toastId,
-        description: errorMessage,
-      });
+      toast.error(
+        "Failed to load balances. Please reset MetaMask account or try again later.",
+      );
     }
   };
+
+  useEffect(() => {
+    if (signer && address && isCorrectNetwork) {
+      loadBalances();
+    }
+  }, [signer, address, isCorrectNetwork]);
+
+  const handleApprove = async () => {
+    if (!amount || parseFloat(amount) <= 0) {
+      toast.error("Please enter a valid amount");
+      return;
+    }
+
+    if (!isCorrectNetwork) {
+      toast.error("Please switch to Arcology Devnet");
+      return;
+    }
+
+    setIsApproving(true);
+    const toastId = toast.loading("Approving USDC...");
+
+    try {
+      const usdcContract = new ethers.Contract(
+        CONTRACTS.USDC,
+        ERC20_ABI,
+        signer,
+      );
+      const amountInWei = ethers.parseUnits(amount, USDC_DECIMALS);
+
+      const tx = await usdcContract.approve(CONTRACTS.SETTLEMENT, amountInWei);
+      toast.loading("Waiting for approval confirmation...", { id: toastId });
+
+      await tx.wait();
+      toast.success("USDC approved successfully!", { id: toastId });
+      await loadBalances();
+    } catch (err: any) {
+      console.error("Approval error:", err);
+      toast.error("Failed to approve USDC", {
+        id: toastId,
+        description: err.message || "Unknown error",
+      });
+    } finally {
+      setIsApproving(false);
+    }
+  };
+
+  const handleDeposit = async () => {
+    if (!amount || parseFloat(amount) <= 0) {
+      toast.error("Please enter a valid amount");
+      return;
+    }
+
+    if (parseFloat(amount) > parseFloat(balance)) {
+      toast.error("Insufficient USDC balance");
+      return;
+    }
+
+    if (parseFloat(amount) > parseFloat(allowance)) {
+      toast.error("Please approve USDC first");
+      return;
+    }
+
+    if (!isCorrectNetwork) {
+      toast.error("Please switch to Arcology Devnet");
+      return;
+    }
+
+    setIsDepositing(true);
+    const toastId = toast.loading("Depositing USDC...");
+
+    try {
+      const settlementContract = new ethers.Contract(
+        CONTRACTS.SETTLEMENT,
+        SETTLEMENT_ABI,
+        signer,
+      );
+      const amountInWei = ethers.parseUnits(amount, USDC_DECIMALS);
+
+      const tx = await settlementContract.deposit(amountInWei);
+      toast.loading("Waiting for deposit confirmation...", { id: toastId });
+
+      await tx.wait();
+      toast.success("USDC deposited successfully!", { id: toastId });
+      setAmount("");
+      await loadBalances();
+    } catch (err: any) {
+      console.error("Deposit error:", err);
+      toast.error("Failed to deposit USDC", {
+        id: toastId,
+        description: err.message || "Unknown error",
+      });
+    } finally {
+      setIsDepositing(false);
+    }
+  };
+
+  const handleMaxClick = () => {
+    setAmount(balance);
+  };
+
+  if (!address) {
+    return (
+      <div className="flex flex-col gap-4 rounded-lg border p-6">
+        <h2 className="text-xl font-semibold">1. Deposit USDC</h2>
+        <p className="text-muted-foreground text-sm text-center py-4">
+          Please connect your wallet to deposit USDC
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-4 rounded-lg border p-6">
       <h2 className="text-xl font-semibold">1. Deposit USDC</h2>
-      <p className="text-muted-foreground text-sm">
-        Enter the amount of USDC to deposit into the settlement contract.
+
+      {!isCorrectNetwork && (
+        <div className="bg-orange-500/10 border border-orange-500/20 rounded-lg p-3 text-sm text-orange-600 dark:text-orange-400">
+          ⚠️ Wrong Network - Please switch to Arcology Devnet
+        </div>
+      )}
+
+      <div className="bg-muted/50 rounded-lg p-4 space-y-2 text-sm">
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Wallet Balance:</span>
+          <span className="font-semibold">
+            {parseFloat(balance).toFixed(2)} USDC
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Allowance:</span>
+          <span className="font-semibold">
+            {parseFloat(allowance).toFixed(2)} USDC
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Deposited:</span>
+          <span className="font-semibold">
+            {parseFloat(depositBalance).toFixed(2)} USDC
+          </span>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <label className="text-sm font-medium">Amount (USDC)</label>
+        <div className="flex gap-2">
+          <input
+            type="number"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            placeholder="0.00"
+            className="flex-1 p-2 bg-background border rounded-md focus:outline-none focus:ring-2 focus:ring-ring"
+            disabled={isApproving || isDepositing || !isCorrectNetwork}
+          />
+          <button
+            onClick={handleMaxClick}
+            disabled={isApproving || isDepositing || !isCorrectNetwork}
+            className="px-4 py-2 bg-secondary text-secondary-foreground hover:bg-secondary/80 rounded-md font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            MAX
+          </button>
+        </div>
+      </div>
+
+      <div className="flex gap-3">
+        <button
+          onClick={handleApprove}
+          disabled={isApproving || isDepositing || !amount || !isCorrectNetwork}
+          className="flex-1 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded-md font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {isApproving ? "Approving..." : "Approve USDC"}
+        </button>
+
+        <button
+          onClick={handleDeposit}
+          disabled={isDepositing || isApproving || !amount || !isCorrectNetwork}
+          className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {isDepositing ? "Depositing..." : "Deposit USDC"}
+        </button>
+      </div>
+
+      <p className="text-muted-foreground text-xs">
+        Enter the amount of USDC to deposit into the settlement contract on
+        Arcology Devnet.
       </p>
-      <input
-        type="number"
-        value={amount}
-        onChange={(e) => setAmount(e.target.value)}
-        placeholder="e.g., 100 USDC"
-        className="w-full p-2 bg-background border rounded-md focus:outline-none focus:ring-2 focus:ring-ring"
-        disabled={!signer}
-      />
-      <button
-        onClick={handleDeposit}
-        disabled={!signer}
-        className="w-full px-4 py-2 bg-primary text-primary-foreground hover:bg-primary/90 rounded-md font-semibold disabled:bg-muted disabled:text-muted-foreground disabled:cursor-not-allowed"
-      >
-        Deposit USDC
-      </button>
     </div>
   );
 }

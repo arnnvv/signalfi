@@ -10,21 +10,99 @@ import {
   useEffect,
 } from "react";
 import { toast } from "sonner";
+import { NETWORK_CONFIG } from "@/lib/config";
 
 interface WalletContextType {
   address: string | null;
   signer: ethers.JsonRpcSigner | null;
+  provider: ethers.BrowserProvider | null;
+  chainId: number | null;
+  isCorrectNetwork: boolean;
   connectWallet: () => Promise<void>;
   disconnectWallet: () => void;
+  switchToArcologyNetwork: () => Promise<void>;
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
 
 const STORAGE_KEY = "wallet_connected";
 
+function createArcologyProvider(ethereumProvider: any, account: string) {
+  const provider = new ethers.BrowserProvider(ethereumProvider);
+
+  const originalCall = provider.call.bind(provider);
+  provider.call = async function (transaction: any) {
+    if (!transaction.from && account) {
+      transaction = {
+        ...transaction,
+        from: account,
+      };
+    }
+    return originalCall(transaction);
+  };
+
+  return provider;
+}
+
+async function createArcologySigner(ethereumProvider: any, account: string) {
+  const provider = createArcologyProvider(ethereumProvider, account);
+  const signer = await provider.getSigner();
+
+  const originalEstimateGas = signer.estimateGas.bind(signer);
+  signer.estimateGas = async function (transaction: any) {
+    if (!transaction.from) {
+      transaction = {
+        ...transaction,
+        from: account,
+      };
+    }
+    return originalEstimateGas(transaction);
+  };
+
+  return signer;
+}
+
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null);
   const [signer, setSigner] = useState<ethers.JsonRpcSigner | null>(null);
+  const [provider, setProvider] = useState<ethers.BrowserProvider | null>(null);
+  const [chainId, setChainId] = useState<number | null>(null);
+
+  const isCorrectNetwork = chainId === NETWORK_CONFIG.chainId;
+
+  const switchToArcologyNetwork = useCallback(async () => {
+    if (typeof window.ethereum === "undefined") return;
+
+    try {
+      await window.ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: NETWORK_CONFIG.chainIdHex }],
+      });
+    } catch (switchError: any) {
+      if (switchError.code === 4902) {
+        try {
+          await window.ethereum.request({
+            method: "wallet_addEthereumChain",
+            params: [
+              {
+                chainId: NETWORK_CONFIG.chainIdHex,
+                chainName: NETWORK_CONFIG.chainName,
+                nativeCurrency: NETWORK_CONFIG.nativeCurrency,
+                rpcUrls: [NETWORK_CONFIG.rpcUrl],
+                blockExplorerUrls: NETWORK_CONFIG.blockExplorerUrl
+                  ? [NETWORK_CONFIG.blockExplorerUrl]
+                  : [],
+              },
+            ],
+          });
+        } catch (addError) {
+          throw new Error("Failed to add Arcology network to MetaMask");
+        }
+      } else {
+        throw switchError;
+      }
+    }
+  }, []);
 
   const connectWallet = useCallback(async () => {
     if (typeof window.ethereum === "undefined") {
@@ -35,18 +113,42 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
 
     try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      await provider.send("eth_requestAccounts", []);
-      const signerInstance = await provider.getSigner();
-      const userAddress = await signerInstance.getAddress();
+      const accounts = await window.ethereum.request({
+        method: "eth_requestAccounts",
+      });
 
-      setSigner(signerInstance);
-      setAddress(userAddress);
+      const web3Provider = createArcologyProvider(window.ethereum, accounts[0]);
+      const web3Signer = await createArcologySigner(
+        window.ethereum,
+        accounts[0],
+      );
+      const network = await web3Provider.getNetwork();
 
+      if (Number(network.chainId) !== NETWORK_CONFIG.chainId) {
+        await switchToArcologyNetwork();
+        const newProvider = createArcologyProvider(
+          window.ethereum,
+          accounts[0],
+        );
+        const newSigner = await createArcologySigner(
+          window.ethereum,
+          accounts[0],
+        );
+        const newNetwork = await newProvider.getNetwork();
+        setProvider(newProvider);
+        setSigner(newSigner);
+        setChainId(Number(newNetwork.chainId));
+      } else {
+        setProvider(web3Provider);
+        setSigner(web3Signer);
+        setChainId(Number(network.chainId));
+      }
+
+      setAddress(accounts[0]);
       localStorage.setItem(STORAGE_KEY, "true");
 
       toast.success("Wallet Connected!", {
-        description: `${userAddress.substring(0, 6)}...${userAddress.substring(userAddress.length - 4)}`,
+        description: `${accounts[0].substring(0, 6)}...${accounts[0].substring(accounts[0].length - 4)}`,
       });
     } catch (err) {
       console.error("Failed to connect wallet:", err);
@@ -54,11 +156,13 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         description: "The request was rejected by the user.",
       });
     }
-  }, []);
+  }, [switchToArcologyNetwork]);
 
   const disconnectWallet = useCallback(() => {
     setSigner(null);
     setAddress(null);
+    setProvider(null);
+    setChainId(null);
     localStorage.removeItem(STORAGE_KEY);
     toast.info("Wallet Disconnected");
   }, []);
@@ -71,17 +175,27 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!wasConnected) return;
 
       try {
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        const accounts = await provider.send("eth_accounts", []);
+        const accounts = await window.ethereum.request({
+          method: "eth_accounts",
+        });
 
         if (accounts.length > 0) {
-          const signerInstance = await provider.getSigner();
-          const userAddress = await signerInstance.getAddress();
+          const web3Provider = createArcologyProvider(
+            window.ethereum,
+            accounts[0],
+          );
+          const web3Signer = await createArcologySigner(
+            window.ethereum,
+            accounts[0],
+          );
+          const network = await web3Provider.getNetwork();
 
-          setSigner(signerInstance);
-          setAddress(userAddress);
+          setProvider(web3Provider);
+          setSigner(web3Signer);
+          setAddress(accounts[0]);
+          setChainId(Number(network.chainId));
 
-          console.log("Auto-connected to wallet:", userAddress);
+          console.log("Auto-connected to wallet:", accounts[0]);
         } else {
           localStorage.removeItem(STORAGE_KEY);
         }
@@ -122,7 +236,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   return (
     <WalletContext.Provider
-      value={{ address, signer, connectWallet, disconnectWallet }}
+      value={{
+        address,
+        signer,
+        provider,
+        chainId,
+        isCorrectNetwork,
+        connectWallet,
+        disconnectWallet,
+        switchToArcologyNetwork,
+      }}
     >
       {children}
     </WalletContext.Provider>
